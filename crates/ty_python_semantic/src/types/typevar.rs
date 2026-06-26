@@ -1146,6 +1146,7 @@ impl<'db> BoundTypeVarInstance<'db> {
             | TypeMapping::ReplaceParameterDefaults
             | TypeMapping::BindLegacyTypevars(_)
             | TypeMapping::ReplaceRecursiveOrigin { .. }
+            | TypeMapping::ReplaceRecursiveAliasComponent { .. }
             | TypeMapping::ReplaceDivergent { .. }
             | TypeMapping::FoldRecursive { .. }
             | TypeMapping::EagerExpansion
