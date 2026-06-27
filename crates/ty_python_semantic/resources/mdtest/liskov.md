@@ -692,6 +692,14 @@ class IteratesStr:
 
 class IncompatibleIterators(IteratesInt, IteratesStr): ...  # error: [invalid-method-override]
 
+class AssignedCallable:
+    assigned = lambda self: ""
+
+class DefinedCallable:
+    def assigned(self) -> int: ...
+
+class AssignedCallableConflict(AssignedCallable, DefinedCallable): ...  # error: [invalid-method-override]
+
 class GenericReturn(Generic[T]):
     def method(self) -> T: ...
 

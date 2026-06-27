@@ -140,7 +140,7 @@ fn check_inherited_method_conflicts<'db>(
             clippy::iter_over_hash_type,
             reason = "candidate names are sorted before diagnostics are emitted"
         )]
-        for name in source_method_names_in_mro(db, *base) {
+        for name in callable_member_names_in_mro(db, *base, class_instance) {
             if !seen_names.insert(name.clone()) {
                 candidates.insert(name);
             }
@@ -216,9 +216,12 @@ fn check_inherited_method_conflicts<'db>(
     }
 }
 
-/// Returns the effective source-defined method names exposed by `class` without resolving their
-/// types.
-fn source_method_names_in_mro<'db>(db: &'db dyn Db, class: ClassType<'db>) -> FxHashSet<Name> {
+/// Returns the effective callable member names exposed by `class`.
+fn callable_member_names_in_mro<'db>(
+    db: &'db dyn Db,
+    class: ClassType<'db>,
+    receiver: Type<'db>,
+) -> FxHashSet<Name> {
     let mut seen_names = FxHashSet::default();
     let mut methods = FxHashSet::default();
 
@@ -234,8 +237,18 @@ fn source_method_names_in_mro<'db>(db: &'db dyn Db, class: ClassType<'db>) -> Fx
             if !seen_names.insert(name.clone()) {
                 continue;
             }
-            if let Some(symbol_id) = table.symbol_id(name)
-                && is_function_definition(db, scope, symbol_id)
+
+            let member = Type::instance(db, class).member_lookup_with_policy_and_receiver(
+                db,
+                name.clone(),
+                MemberLookupPolicy::default(),
+                Some(receiver),
+            );
+            if member
+                .place
+                .ignore_possibly_undefined()
+                .and_then(|ty| ty.try_upcast_to_callable(db))
+                .is_some()
             {
                 methods.insert(name.clone());
             }
@@ -248,12 +261,11 @@ fn source_method_names_in_mro<'db>(db: &'db dyn Db, class: ClassType<'db>) -> Fx
 #[derive(Debug, Clone, Copy)]
 struct MethodContract<'db> {
     owner: ClassType<'db>,
-    definition: Definition<'db>,
+    definition: Option<Definition<'db>>,
     ty: Type<'db>,
 }
 
-/// Returns the effective source-defined method contract exposed by `class`, bound as it will be on
-/// `receiver`.
+/// Returns the effective method contract exposed by `class`, bound as it will be on `receiver`.
 fn effective_method_contract<'db>(
     db: &'db dyn Db,
     class: ClassType<'db>,
@@ -273,10 +285,9 @@ fn effective_method_contract<'db>(
 
         let (owner_literal, _) = owner.static_class_literal(db)?;
         let scope = owner_literal.body_scope(db);
-        let symbol = place_table(db, scope).symbol_id(name)?;
-        if !is_function_definition(db, scope, symbol) {
-            return None;
-        }
+        let definition = place_table(db, scope)
+            .symbol_id(name)
+            .and_then(|symbol| symbol_definition(db, scope, symbol));
 
         let member = Type::instance(db, class).member_lookup_with_policy_and_receiver(
             db,
@@ -292,7 +303,7 @@ fn effective_method_contract<'db>(
 
         return Some(MethodContract {
             owner,
-            definition: symbol_definition(db, scope, symbol)?,
+            definition,
             ty,
         });
     }
