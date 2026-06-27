@@ -100,8 +100,7 @@ pub(super) fn check_class<'db>(context: &InferContext<'db, '_>, class: StaticCla
     }
 }
 
-/// Checks that the method selected by the MRO is compatible with the contract of every direct
-/// base class.
+/// Checks that the method selected by the MRO is compatible with every inherited contract.
 ///
 /// The normal override checks only inspect methods defined in the subclass itself. With multiple
 /// inheritance, a method inherited from an earlier base can override an incompatible method
@@ -170,8 +169,12 @@ fn check_inherited_method_conflicts<'db>(
             continue;
         }
 
-        for base in &direct_bases {
-            let Some(base_contract) = effective_method_contract(db, *base, class_instance, &member)
+        for base in class_specialized
+            .iter_mro(db)
+            .skip(1)
+            .filter_map(ClassBase::into_class)
+        {
+            let Some(base_contract) = effective_method_contract(db, base, class_instance, &member)
             else {
                 continue;
             };

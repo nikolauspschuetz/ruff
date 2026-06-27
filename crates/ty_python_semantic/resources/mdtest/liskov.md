@@ -637,15 +637,15 @@ class ProtocolWithClassVarImpl(ProtocolBase):
 
 ## Multiple inheritance
 
-The method selected by the MRO must be compatible with the corresponding method on every direct base
-class. Here, `ReturnsStr.method` is selected, but `IncompatibleReturns` is also a subtype of
+The method selected by the MRO must be compatible with every corresponding method contract in the
+base classes. Here, `ReturnsStr.method` is selected, but `IncompatibleReturns` is also a subtype of
 `ReturnsInt`. Contracts are resolved through indirect and specialized bases and bound to the final
 subclass before comparison, so the effective method may come from the second direct base.
 
 `multiple_inheritance.pyi`:
 
 ```pyi
-from typing import Generic, TypeVar, overload
+from typing import Any, Generic, TypeVar, overload
 
 T = TypeVar("T")
 
@@ -662,6 +662,17 @@ class IncompatibleReturns(ReturnsStr, ReturnsInt): ...  # snapshot: invalid-meth
 class CompatibleReturns(ReturnsBool, ReturnsInt): ...
 class IntermediateReturnsStr(ReturnsStr): ...
 class IndirectConflict(IntermediateReturnsStr, ReturnsInt): ...  # error: [invalid-method-override]
+
+class AcceptsInt:
+    def parameter(self, value: int) -> None: ...
+
+class AcceptsAny(AcceptsInt):
+    def parameter(self, value: Any) -> None: ...
+
+class AcceptsStr:
+    def parameter(self, value: str) -> None: ...
+
+class GradualConflict(AcceptsStr, AcceptsAny): ...  # error: [invalid-method-override]
 
 class GenericReturn(Generic[T]):
     def method(self) -> T: ...
