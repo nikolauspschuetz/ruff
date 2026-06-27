@@ -756,6 +756,62 @@ info: incompatible return types: `str` is not assignable to `int`
 info: This violates the Liskov Substitution Principle
 ```
 
+## Enum methods managed during class creation
+
+`EnumType` only replaces representation methods inherited from the enum's data type or `object`;
+ordinary mixin methods remain part of the effective MRO and must still be compatible. On Python 3.11
+and newer, `EnumType` also installs `Flag`'s operators directly on each `Flag` subclass.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from enum import Enum, Flag
+from typing import Literal
+
+class FirstString:
+    def __str__(self) -> Literal["first"]:
+        return "first"
+
+class SecondString:
+    def __str__(self) -> Literal["second"]:
+        return "second"
+
+class PreservesStringMixin(FirstString, SecondString, Enum):  # error: [invalid-method-override]
+    MEMBER = 1
+
+class OrMixin:
+    def __or__(self, other: object) -> Literal["mixin"]:
+        return "mixin"
+
+class UsesGeneratedFlagOperator(OrMixin, Flag):
+    MEMBER = 1
+```
+
+## Flag methods before Python 3.11
+
+Before Python 3.11, `EnumType` did not install `Flag`'s operators on each subclass, so an earlier
+mixin's implementation remains effective and is checked against `Flag`'s contract.
+
+```toml
+[environment]
+python-version = "3.10"
+```
+
+```py
+from enum import Flag
+from typing import Literal
+
+class OrMixin:
+    def __or__(self, other: object) -> Literal["mixin"]:
+        return "mixin"
+
+class PreservesFlagMixin(OrMixin, Flag):  # error: [invalid-method-override]
+    MEMBER = 1
+```
+
 ## The entire class hierarchy is checked
 
 If a child class's method definition is Liskov-compatible with the method definition on its parent
