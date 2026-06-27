@@ -700,6 +700,22 @@ class DefinedCallable:
 
 class AssignedCallableConflict(AssignedCallable, DefinedCallable): ...  # error: [invalid-method-override]
 
+class CallableObject:
+    def __call__(self, value: int) -> None: ...
+
+class CallableObjectBase:
+    callable_object = CallableObject()
+
+class CompatibleCallableObject:
+    def callable_object(self, value: int) -> None: ...
+
+class IncompatibleCallableObject:
+    def callable_object(self, value: str) -> None: ...
+
+class CallableObjectFirst(CallableObjectBase, CompatibleCallableObject): ...
+class CallableObjectSecond(CompatibleCallableObject, CallableObjectBase): ...
+class CallableObjectConflict(CallableObjectBase, IncompatibleCallableObject): ...  # error: [invalid-method-override]
+
 class GenericReturn(Generic[T]):
     def method(self) -> T: ...
 

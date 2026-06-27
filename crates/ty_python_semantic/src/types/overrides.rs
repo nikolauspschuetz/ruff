@@ -299,6 +299,7 @@ fn effective_method_contract<'db>(
             .place
             .ignore_possibly_undefined()?
             .try_upcast_to_callable(db)?
+            .map(|callable| callable.into_regular(db))
             .into_type(db);
 
         return Some(MethodContract {
