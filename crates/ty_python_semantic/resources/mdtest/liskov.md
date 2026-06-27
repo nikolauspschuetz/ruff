@@ -645,6 +645,7 @@ subclass before comparison, so the effective method may come from the second dir
 `multiple_inheritance.pyi`:
 
 ```pyi
+from collections.abc import Iterator
 from typing import Any, Generic, TypeVar, overload
 
 T = TypeVar("T")
@@ -683,6 +684,14 @@ class CascadeRight:
 class IntroducesConflict(CascadeLeft, CascadeRight): ...  # error: [invalid-method-override]
 class InheritsConflict(IntroducesConflict, CascadeRight): ...
 
+class IteratesInt:
+    def __iter__(self) -> Iterator[int]: ...
+
+class IteratesStr:
+    def __iter__(self) -> Iterator[str]: ...
+
+class IncompatibleIterators(IteratesInt, IteratesStr): ...  # error: [invalid-method-override]
+
 class GenericReturn(Generic[T]):
     def method(self) -> T: ...
 
@@ -704,19 +713,19 @@ class FinalReceiver(Left, Right): ...  # error: [invalid-method-override]
 
 ```snapshot
 error[invalid-method-override]: Base classes for class `IncompatibleReturns` define method `method` incompatibly
-  --> src/multiple_inheritance.pyi:6:9
+  --> src/multiple_inheritance.pyi:7:9
    |
- 6 |     def method(self) -> str: ...
+ 7 |     def method(self) -> str: ...
    |         ------ `ReturnsStr.method` defined here
- 7 |
- 8 | class ReturnsInt:
- 9 |     def method(self) -> int: ...
+ 8 |
+ 9 | class ReturnsInt:
+10 |     def method(self) -> int: ...
    |         ------ `ReturnsInt.method` defined here
-10 |
-11 | class ReturnsBool:
-12 |     def method(self) -> bool: ...
-13 |
-14 | class IncompatibleReturns(ReturnsStr, ReturnsInt): ...  # snapshot: invalid-method-override
+11 |
+12 | class ReturnsBool:
+13 |     def method(self) -> bool: ...
+14 |
+15 | class IncompatibleReturns(ReturnsStr, ReturnsInt): ...  # snapshot: invalid-method-override
    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `ReturnsStr.method` is incompatible with `ReturnsInt.method`
    |
 info: incompatible return types: `str` is not assignable to `int`

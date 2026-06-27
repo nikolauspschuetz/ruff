@@ -9,7 +9,7 @@ use ruff_db::{
     files::FileRange,
     parsed::ParsedModuleRef,
 };
-use ruff_python_ast::{helpers::is_dunder, name::Name};
+use ruff_python_ast::name::Name;
 use ruff_python_stdlib::identifiers::is_mangled_private;
 use rustc_hash::FxHashSet;
 
@@ -33,7 +33,7 @@ use crate::{
             report_invalid_method_override, report_overridden_final_method,
             report_overridden_final_variable,
         },
-        enums::{EnumMetadata, enum_metadata},
+        enums::{EnumMetadata, enum_metadata, is_enum_class_by_inheritance},
         function::{FunctionDecorators, FunctionType, KnownFunction, OverloadLiteral},
         infer::infer_definition_types,
         list_members::{Member, MemberWithDefinition, all_end_of_scope_members},
@@ -151,10 +151,12 @@ fn check_inherited_method_conflicts<'db>(
     candidates.sort_unstable();
 
     'members: for member in candidates {
-        // Class creation can synthesize or replace dunder methods (for example on Enum classes).
-        // Keep this pass to ordinary source methods until those generated contracts are represented
-        // by the common member model.
-        if is_mangled_private(member.as_str()) || is_dunder(member.as_str()) {
+        // Constructors and methods rewritten during class creation are checked through their
+        // specialized rules rather than ordinary method substitutability.
+        if is_mangled_private(member.as_str())
+            || is_constructor_like_method(member.as_str())
+            || is_enum_method_managed_by_class_creation(db, class, member.as_str())
+        {
             continue;
         }
 
@@ -1203,6 +1205,29 @@ fn is_constructor_like_method(name: &str) -> bool {
         name,
         "__init__" | "__new__" | "__post_init__" | "__init_subclass__"
     )
+}
+
+/// Returns whether `EnumType` manages an inherited method when creating `class`.
+fn is_enum_method_managed_by_class_creation<'db>(
+    db: &'db dyn Db,
+    class: StaticClassLiteral<'db>,
+    name: &str,
+) -> bool {
+    if !is_enum_class_by_inheritance(db, class) {
+        return false;
+    }
+
+    if matches!(
+        name,
+        "__repr__" | "__str__" | "__format__" | "__reduce_ex__"
+    ) {
+        return true;
+    }
+
+    matches!(
+        name,
+        "__or__" | "__and__" | "__xor__" | "__ror__" | "__rand__" | "__rxor__" | "__invert__"
+    ) && Type::ClassLiteral(class.into()).is_subtype_of(db, KnownClass::Flag.to_subclass_of(db))
 }
 
 bitflags! {
