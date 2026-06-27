@@ -11,7 +11,7 @@ use ruff_db::{
 };
 use ruff_python_ast::name::Name;
 use ruff_python_stdlib::identifiers::is_mangled_private;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     Db,
@@ -132,34 +132,25 @@ fn check_inherited_method_conflicts<'db>(
     }
 
     let class_instance = Type::instance(db, class_specialized);
-    let mut seen_names = FxHashSet::default();
-    let mut candidates = FxHashSet::default();
-
-    for base in &direct_bases {
-        #[expect(
-            clippy::iter_over_hash_type,
-            reason = "candidate names are sorted before diagnostics are emitted"
-        )]
-        for name in callable_member_names_in_mro(db, *base, class_instance) {
-            if !seen_names.insert(name.clone()) {
-                candidates.insert(name);
-            }
-        }
-    }
-
-    let mut candidates: Vec<_> = candidates.into_iter().collect();
+    let mut candidates: Vec<_> = inherited_member_candidates(db, &direct_bases)
+        .into_iter()
+        .filter(|member| {
+            !is_mangled_private(member.as_str())
+                && !is_constructor_like_method(member.as_str())
+                && !is_enum_method_managed_by_class_creation(db, class, member.as_str())
+        })
+        .filter(|member| {
+            direct_bases
+                .iter()
+                .filter(|base| is_callable_member(db, **base, class_instance, member))
+                .take(2)
+                .count()
+                == 2
+        })
+        .collect();
     candidates.sort_unstable();
 
     'members: for member in candidates {
-        // Constructors and methods rewritten during class creation are checked through their
-        // specialized rules rather than ordinary method substitutability.
-        if is_mangled_private(member.as_str())
-            || is_constructor_like_method(member.as_str())
-            || is_enum_method_managed_by_class_creation(db, class, member.as_str())
-        {
-            continue;
-        }
-
         let Some(override_contract) =
             effective_method_contract(db, class_specialized, class_instance, &member)
         else {
@@ -216,46 +207,63 @@ fn check_inherited_method_conflicts<'db>(
     }
 }
 
-/// Returns the effective callable member names exposed by `class`.
-fn callable_member_names_in_mro<'db>(
+/// Returns names present in multiple base MROs and defined by more than one class.
+///
+/// Both conditions are necessary for an inherited conflict, so this structural pass avoids
+/// receiver-aware member lookups for names that the later owner checks would necessarily discard.
+fn inherited_member_candidates<'db>(
     db: &'db dyn Db,
-    class: ClassType<'db>,
-    receiver: Type<'db>,
+    direct_bases: &[ClassType<'db>],
 ) -> FxHashSet<Name> {
-    let mut seen_names = FxHashSet::default();
-    let mut methods = FxHashSet::default();
+    let mut definitions = FxHashMap::default();
 
-    for owner in class.iter_mro(db).filter_map(ClassBase::into_class) {
-        let Some((owner_literal, _)) = owner.static_class_literal(db) else {
-            continue;
-        };
-        let scope = owner_literal.body_scope(db);
-        let table = place_table(db, scope);
-
-        for symbol in table.symbols().filter(|symbol| symbol.is_local()) {
-            let name = symbol.name();
-            if !seen_names.insert(name.clone()) {
+    for (base_index, base) in direct_bases.iter().enumerate() {
+        for owner in base.iter_mro(db).filter_map(ClassBase::into_class) {
+            let Some((owner_literal, _)) = owner.static_class_literal(db) else {
                 continue;
-            }
+            };
+            let scope = owner_literal.body_scope(db);
+            let table = place_table(db, scope);
 
-            let member = Type::instance(db, class).member_lookup_with_policy_and_receiver(
-                db,
-                name.clone(),
-                MemberLookupPolicy::default(),
-                Some(receiver),
-            );
-            if member
-                .place
-                .ignore_possibly_undefined()
-                .and_then(|ty| ty.try_upcast_to_callable(db))
-                .is_some()
-            {
-                methods.insert(name.clone());
+            for symbol in table.symbols().filter(|symbol| symbol.is_local()) {
+                let name = symbol.name();
+                if let Some((first_owner, first_base, multiple_owners, multiple_bases)) =
+                    definitions.get_mut(name)
+                {
+                    *multiple_owners |= *first_owner != owner_literal;
+                    *multiple_bases |= *first_base != base_index;
+                } else {
+                    definitions.insert(name.clone(), (owner_literal, base_index, false, false));
+                }
             }
         }
     }
 
-    methods
+    definitions
+        .into_iter()
+        .filter_map(|(name, (_, _, multiple_owners, multiple_bases))| {
+            (multiple_owners && multiple_bases).then_some(name)
+        })
+        .collect()
+}
+
+fn is_callable_member<'db>(
+    db: &'db dyn Db,
+    class: ClassType<'db>,
+    receiver: Type<'db>,
+    name: &Name,
+) -> bool {
+    Type::instance(db, class)
+        .member_lookup_with_policy_and_receiver(
+            db,
+            name.clone(),
+            MemberLookupPolicy::default(),
+            Some(receiver),
+        )
+        .place
+        .ignore_possibly_undefined()
+        .and_then(|ty| ty.try_upcast_to_callable(db))
+        .is_some()
 }
 
 #[derive(Debug, Clone, Copy)]
