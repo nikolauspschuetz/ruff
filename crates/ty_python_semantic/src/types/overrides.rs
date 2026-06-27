@@ -9,7 +9,7 @@ use ruff_db::{
     files::FileRange,
     parsed::ParsedModuleRef,
 };
-use ruff_python_ast::name::Name;
+use ruff_python_ast::{helpers::is_dunder, name::Name};
 use ruff_python_stdlib::identifiers::is_mangled_private;
 use rustc_hash::FxHashSet;
 
@@ -19,8 +19,8 @@ use crate::{
     place::{DefinedPlace, Place, PlaceAndQualifiers, TypeOrigin},
     reachability::ReachabilityConstraintsExtension,
     types::{
-        CallableType, ClassBase, ClassLiteral, ClassType, KnownClass, Parameter, Parameters,
-        Signature, StaticClassLiteral, Type, TypeContext, TypeQualifiers,
+        CallableType, ClassBase, ClassLiteral, ClassType, KnownClass, MemberLookupPolicy,
+        Parameter, Parameters, Signature, StaticClassLiteral, Type, TypeContext, TypeQualifiers,
         call::CallArguments,
         class::{CodeGeneratorKind, FieldKind},
         constraints::ConstraintSetBuilder,
@@ -29,8 +29,9 @@ use crate::{
             INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_OVERRIDE, INVALID_DATACLASS,
             INVALID_EXPLICIT_OVERRIDE, INVALID_METHOD_OVERRIDE, INVALID_NAMED_TUPLE,
             INVALID_NAMED_TUPLE_OVERRIDE, MISSING_OVERRIDE_DECORATOR, OVERRIDE_OF_FINAL_METHOD,
-            OVERRIDE_OF_FINAL_VARIABLE, report_invalid_method_override,
-            report_overridden_final_method, report_overridden_final_variable,
+            OVERRIDE_OF_FINAL_VARIABLE, report_incompatible_base_method,
+            report_invalid_method_override, report_overridden_final_method,
+            report_overridden_final_variable,
         },
         enums::{EnumMetadata, enum_metadata},
         function::{FunctionDecorators, FunctionType, KnownFunction, OverloadLiteral},
@@ -75,6 +76,10 @@ pub(super) fn check_class<'db>(context: &InferContext<'db, '_>, class: StaticCla
     }
 
     let class_specialized = class.identity_specialization(db);
+    if configuration.check_method_liskov_violations() {
+        check_inherited_method_conflicts(context, class, class_specialized);
+    }
+
     let scope = class.body_scope(db);
     let own_class_members: FxHashSet<_> = all_end_of_scope_members(db, scope).collect();
     let enum_info = enum_metadata(db, class.into());
@@ -93,6 +98,232 @@ pub(super) fn check_class<'db>(context: &InferContext<'db, '_>, class: StaticCla
             &member,
         );
     }
+}
+
+/// Checks that the method selected by the MRO is compatible with the contract of every direct
+/// base class.
+///
+/// The normal override checks only inspect methods defined in the subclass itself. With multiple
+/// inheritance, a method inherited from an earlier base can override an incompatible method
+/// inherited from a later base.
+fn check_inherited_method_conflicts<'db>(
+    context: &InferContext<'db, '_>,
+    class: StaticClassLiteral<'db>,
+    class_specialized: ClassType<'db>,
+) {
+    let db = context.db();
+    let direct_bases: Vec<_> = class
+        .explicit_bases(db)
+        .iter()
+        .filter_map(|base| base.to_class_type(db))
+        .collect();
+
+    if direct_bases.len() < 2 || class.try_mro(db, None).is_err() {
+        return;
+    }
+
+    // Avoid cascading diagnostics for class definitions whose bases cannot coexist in an MRO.
+    let constraints = ConstraintSetBuilder::new();
+    if direct_bases.iter().enumerate().any(|(index, left)| {
+        direct_bases[index + 1..]
+            .iter()
+            .any(|right| !left.could_coexist_in_mro_with(db, *right, &constraints))
+    }) {
+        return;
+    }
+
+    let class_instance = Type::instance(db, class_specialized);
+    let mut seen_names = FxHashSet::default();
+    let mut candidates = FxHashSet::default();
+
+    for base in &direct_bases {
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "candidate names are sorted before diagnostics are emitted"
+        )]
+        for name in source_method_names_in_mro(db, *base) {
+            if !seen_names.insert(name.clone()) {
+                candidates.insert(name);
+            }
+        }
+    }
+
+    let mut candidates: Vec<_> = candidates.into_iter().collect();
+    candidates.sort_unstable();
+
+    'members: for member in candidates {
+        // Class creation can synthesize or replace dunder methods (for example on Enum classes).
+        // Keep this pass to ordinary source methods until those generated contracts are represented
+        // by the common member model.
+        if is_mangled_private(member.as_str()) || is_dunder(member.as_str()) {
+            continue;
+        }
+
+        let Some(override_contract) =
+            effective_method_contract(db, class_specialized, class_instance, &member)
+        else {
+            continue;
+        };
+
+        // A method defined directly on the class is handled by the normal override pass.
+        if override_contract.owner.class_literal(db) == ClassLiteral::Static(class) {
+            continue;
+        }
+
+        for base in &direct_bases {
+            let Some(base_contract) = effective_method_contract(db, *base, class_instance, &member)
+            else {
+                continue;
+            };
+
+            if override_contract.owner.class_literal(db) == base_contract.owner.class_literal(db) {
+                continue;
+            }
+
+            if override_contract.ty.is_assignable_to(db, base_contract.ty) {
+                continue;
+            }
+
+            if inherited_conflict_exists_on_owner(
+                db,
+                &member,
+                override_contract.owner,
+                base_contract.owner,
+            ) {
+                continue;
+            }
+
+            report_incompatible_base_method(
+                context,
+                class,
+                &member,
+                (override_contract.owner, override_contract.definition),
+                (base_contract.owner, base_contract.definition),
+                || {
+                    override_contract
+                        .ty
+                        .assignability_error_context(db, base_contract.ty)
+                },
+            );
+            continue 'members;
+        }
+    }
+}
+
+/// Returns the effective source-defined method names exposed by `class` without resolving their
+/// types.
+fn source_method_names_in_mro<'db>(db: &'db dyn Db, class: ClassType<'db>) -> FxHashSet<Name> {
+    let mut seen_names = FxHashSet::default();
+    let mut methods = FxHashSet::default();
+
+    for owner in class.iter_mro(db).filter_map(ClassBase::into_class) {
+        let Some((owner_literal, _)) = owner.static_class_literal(db) else {
+            continue;
+        };
+        let scope = owner_literal.body_scope(db);
+        let table = place_table(db, scope);
+
+        for symbol in table.symbols().filter(|symbol| symbol.is_local()) {
+            let name = symbol.name();
+            if !seen_names.insert(name.clone()) {
+                continue;
+            }
+            if let Some(symbol_id) = table.symbol_id(name)
+                && is_function_definition(db, scope, symbol_id)
+            {
+                methods.insert(name.clone());
+            }
+        }
+    }
+
+    methods
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MethodContract<'db> {
+    owner: ClassType<'db>,
+    definition: Definition<'db>,
+    ty: Type<'db>,
+}
+
+/// Returns the effective source-defined method contract exposed by `class`, bound as it will be on
+/// `receiver`.
+fn effective_method_contract<'db>(
+    db: &'db dyn Db,
+    class: ClassType<'db>,
+    receiver: Type<'db>,
+    name: &Name,
+) -> Option<MethodContract<'db>> {
+    for base in class.iter_mro(db) {
+        let owner = match base {
+            ClassBase::Class(owner) => owner,
+            ClassBase::Any | ClassBase::Dynamic(_) | ClassBase::Divergent(_) => return None,
+            ClassBase::Protocol | ClassBase::Generic | ClassBase::TypedDict(_) => continue,
+        };
+
+        if owner.own_class_member(db, None, name).is_undefined() {
+            continue;
+        }
+
+        let (owner_literal, _) = owner.static_class_literal(db)?;
+        let scope = owner_literal.body_scope(db);
+        let symbol = place_table(db, scope).symbol_id(name)?;
+        if !is_function_definition(db, scope, symbol) {
+            return None;
+        }
+
+        let member = Type::instance(db, class).member_lookup_with_policy_and_receiver(
+            db,
+            name.clone(),
+            MemberLookupPolicy::default(),
+            Some(receiver),
+        );
+        let ty = member
+            .place
+            .ignore_possibly_undefined()?
+            .try_upcast_to_callable(db)?
+            .into_type(db);
+
+        return Some(MethodContract {
+            owner,
+            definition: symbol_definition(db, scope, symbol)?,
+            ty,
+        });
+    }
+
+    None
+}
+
+/// Returns `true` if the winning method is already an invalid override on its defining class.
+fn inherited_conflict_exists_on_owner<'db>(
+    db: &'db dyn Db,
+    name: &Name,
+    override_owner: ClassType<'db>,
+    overridden_owner: ClassType<'db>,
+) -> bool {
+    let Some(overridden_ancestor) = override_owner
+        .iter_mro(db)
+        .filter_map(ClassBase::into_class)
+        .find(|ancestor| ancestor.class_literal(db) == overridden_owner.class_literal(db))
+    else {
+        return false;
+    };
+
+    let owner_instance = Type::instance(db, override_owner);
+    let Some(override_contract) =
+        effective_method_contract(db, override_owner, owner_instance, name)
+    else {
+        return false;
+    };
+    let Some(overridden_contract) =
+        effective_method_contract(db, overridden_ancestor, owner_instance, name)
+    else {
+        return false;
+    };
+
+    !override_contract
+        .ty
+        .is_assignable_to(db, overridden_contract.ty)
 }
 
 /// Returns the first inherited `NamedTuple` field in the MRO for `field_name`.

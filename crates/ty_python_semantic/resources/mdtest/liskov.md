@@ -635,6 +635,74 @@ class ProtocolWithClassVarImpl(ProtocolBase):
     instance_attr = 0
 ```
 
+## Multiple inheritance
+
+The method selected by the MRO must be compatible with the corresponding method on every direct base
+class. Here, `ReturnsStr.method` is selected, but `IncompatibleReturns` is also a subtype of
+`ReturnsInt`. Contracts are resolved through indirect and specialized bases and bound to the final
+subclass before comparison, so the effective method may come from the second direct base.
+
+`multiple_inheritance.pyi`:
+
+```pyi
+from typing import Generic, TypeVar, overload
+
+T = TypeVar("T")
+
+class ReturnsStr:
+    def method(self) -> str: ...
+
+class ReturnsInt:
+    def method(self) -> int: ...
+
+class ReturnsBool:
+    def method(self) -> bool: ...
+
+class IncompatibleReturns(ReturnsStr, ReturnsInt): ...  # snapshot: invalid-method-override
+class CompatibleReturns(ReturnsBool, ReturnsInt): ...
+class IntermediateReturnsStr(ReturnsStr): ...
+class IndirectConflict(IntermediateReturnsStr, ReturnsInt): ...  # error: [invalid-method-override]
+
+class GenericReturn(Generic[T]):
+    def method(self) -> T: ...
+
+class GenericConflict(ReturnsStr, GenericReturn[int]): ...  # error: [invalid-method-override]
+
+class ReceiverBase:
+    @overload
+    def selected(self: FinalReceiver) -> int: ...
+    @overload
+    def selected(self) -> str: ...
+
+class Left(ReceiverBase): ...
+
+class Right(ReceiverBase):
+    def selected(self) -> str: ...
+
+class FinalReceiver(Left, Right): ...  # error: [invalid-method-override]
+```
+
+```snapshot
+error[invalid-method-override]: Base classes for class `IncompatibleReturns` define method `method` incompatibly
+  --> src/multiple_inheritance.pyi:6:9
+   |
+ 6 |     def method(self) -> str: ...
+   |         ------ `ReturnsStr.method` defined here
+ 7 |
+ 8 | class ReturnsInt:
+ 9 |     def method(self) -> int: ...
+   |         ------ `ReturnsInt.method` defined here
+10 |
+11 | class ReturnsBool:
+12 |     def method(self) -> bool: ...
+13 |
+14 | class IncompatibleReturns(ReturnsStr, ReturnsInt): ...  # snapshot: invalid-method-override
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `ReturnsStr.method` is incompatible with `ReturnsInt.method`
+   |
+info: incompatible return types: `str` is not assignable to `int`
+info: This violates the Liskov Substitution Principle
+```
+
 ## The entire class hierarchy is checked
 
 If a child class's method definition is Liskov-compatible with the method definition on its parent
