@@ -187,9 +187,10 @@ fn check_inherited_method_conflicts<'db>(
                 continue;
             }
 
-            if inherited_conflict_exists_on_owner(
+            if inherited_conflict_exists_on_base(
                 db,
                 &member,
+                class_specialized,
                 override_contract.owner,
                 base_contract.owner,
             ) {
@@ -297,36 +298,45 @@ fn effective_method_contract<'db>(
     None
 }
 
-/// Returns `true` if the winning method is already an invalid override on its defining class.
-fn inherited_conflict_exists_on_owner<'db>(
+/// Returns `true` if an inherited base already contains the same method conflict.
+fn inherited_conflict_exists_on_base<'db>(
     db: &'db dyn Db,
     name: &Name,
+    class: ClassType<'db>,
     override_owner: ClassType<'db>,
     overridden_owner: ClassType<'db>,
 ) -> bool {
-    let Some(overridden_ancestor) = override_owner
+    class
         .iter_mro(db)
+        .skip(1)
         .filter_map(ClassBase::into_class)
-        .find(|ancestor| ancestor.class_literal(db) == overridden_owner.class_literal(db))
-    else {
-        return false;
-    };
+        .any(|base| {
+            let receiver = Type::instance(db, base);
+            let Some(override_contract) = effective_method_contract(db, base, receiver, name)
+            else {
+                return false;
+            };
+            if override_contract.owner.class_literal(db) != override_owner.class_literal(db) {
+                return false;
+            }
 
-    let owner_instance = Type::instance(db, override_owner);
-    let Some(override_contract) =
-        effective_method_contract(db, override_owner, owner_instance, name)
-    else {
-        return false;
-    };
-    let Some(overridden_contract) =
-        effective_method_contract(db, overridden_ancestor, owner_instance, name)
-    else {
-        return false;
-    };
+            let Some(overridden_ancestor) = base
+                .iter_mro(db)
+                .filter_map(ClassBase::into_class)
+                .find(|ancestor| ancestor.class_literal(db) == overridden_owner.class_literal(db))
+            else {
+                return false;
+            };
+            let Some(overridden_contract) =
+                effective_method_contract(db, overridden_ancestor, receiver, name)
+            else {
+                return false;
+            };
 
-    !override_contract
-        .ty
-        .is_assignable_to(db, overridden_contract.ty)
+            !override_contract
+                .ty
+                .is_assignable_to(db, overridden_contract.ty)
+        })
 }
 
 /// Returns the first inherited `NamedTuple` field in the MRO for `field_name`.

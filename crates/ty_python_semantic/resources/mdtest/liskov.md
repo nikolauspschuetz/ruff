@@ -674,6 +674,15 @@ class AcceptsStr:
 
 class GradualConflict(AcceptsStr, AcceptsAny): ...  # error: [invalid-method-override]
 
+class CascadeLeft:
+    def cascade(self) -> str: ...
+
+class CascadeRight:
+    def cascade(self) -> int: ...
+
+class IntroducesConflict(CascadeLeft, CascadeRight): ...  # error: [invalid-method-override]
+class InheritsConflict(IntroducesConflict, CascadeRight): ...
+
 class GenericReturn(Generic[T]):
     def method(self) -> T: ...
 
