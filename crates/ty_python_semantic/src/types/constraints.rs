@@ -248,6 +248,7 @@ pub struct OwnedConstraintSet<'db> {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::Update)]
 struct OwnedConstraintSetInner<'db> {
     constraints: Box<[Constraint<'db>]>,
+    constraint_typevars: Box<[TypeVarId]>,
     constraint_indices: RankBitBox,
     typevars: IndexVec<TypeVarId, BoundTypeVarIdentity<'db>>,
     nodes: Box<[InteriorNodeData]>,
@@ -698,6 +699,11 @@ struct ConstraintSetStorage<'db> {
     /// structures.
     constraints: IndexVec<ConstraintId, Constraint<'db>>,
 
+    /// The builder-local identity of the typevar constrained by each entry in `constraints`.
+    /// Keeping this parallel to the constraint arena lets hot BDD operations compare and order
+    /// typevars without reconstructing and hashing their semantic identity.
+    constraint_typevars: IndexVec<ConstraintId, TypeVarId>,
+
     /// Typevars are interned so that they have a stable ordering within this builder, which does
     /// not depend on their salsa IDs. (The salsa IDs are not stable, since each typevar can be
     /// used (possibly indirectly) in expressions in different files, and there are no guarantees
@@ -837,6 +843,12 @@ impl<'db> ConstraintSetBuilder<'db> {
             .zip(&used_constraints)
             .filter_map(|(constraint, used)| used.then_some(constraint))
             .collect();
+        let constraint_typevars = storage
+            .constraint_typevars
+            .into_iter()
+            .zip(&used_constraints)
+            .filter_map(|(typevar, used)| used.then_some(typevar))
+            .collect();
         let constraint_indices = RankBitBox::from_bits(used_constraints);
         storage.typevars.shrink_to_fit();
 
@@ -844,6 +856,7 @@ impl<'db> ConstraintSetBuilder<'db> {
             node,
             inner: Some(Arc::new(OwnedConstraintSetInner {
                 constraints,
+                constraint_typevars,
                 constraint_indices,
                 typevars: storage.typevars,
                 nodes,
@@ -995,18 +1008,19 @@ impl<'db> ConstraintSetBuilder<'db> {
         db: &'db dyn Db,
         typevar: BoundTypeVarInstance<'db>,
         bounds: ConstraintBounds<'db>,
-    ) {
-        self.intern_typevar(db, typevar);
+    ) -> TypeVarId {
+        let typevar_id = self.intern_typevar(db, typevar);
         if let Some(lower) = bounds.lower {
             self.intern_mentioned_typevars_in_type(db, lower);
         }
         if let Some(upper) = bounds.upper {
             self.intern_mentioned_typevars_in_type(db, upper);
         }
+        typevar_id
     }
 
     fn intern_constraint(&self, db: &'db dyn Db, data: Constraint<'db>) -> ConstraintId {
-        self.intern_constraint_typevars(db, data.typevar, data.bounds);
+        let typevar_id = self.intern_constraint_typevars(db, data.typevar, data.bounds);
 
         let mut storage = self.storage.borrow_mut();
         storage.ensure_overlay_identity_caches();
@@ -1014,6 +1028,8 @@ impl<'db> ConstraintSetBuilder<'db> {
             return *id;
         }
         let id = storage.constraints.push(data);
+        let typevar_id_index = storage.constraint_typevars.push(typevar_id);
+        debug_assert_eq!(id, typevar_id_index);
         let id = storage.adjusted_constraint_id(id);
         storage.constraint_cache.insert(data, id);
         id
@@ -1043,17 +1059,34 @@ impl<'db> ConstraintSetBuilder<'db> {
     }
 
     fn constraint_data(&self, constraint: ConstraintId) -> Constraint<'db> {
+        self.constraint_data_with_typevar_id(constraint).0
+    }
+
+    fn constraint_data_with_typevar_id(
+        &self,
+        constraint: ConstraintId,
+    ) -> (Constraint<'db>, TypeVarId) {
         let storage = self.storage.borrow();
         if let Some(compacted) = &storage.compacted {
             let index = constraint.index();
             let split = compacted.constraint_indices.len();
             if index < split {
                 let compacted_index = compacted.retained_constraint_index(constraint);
-                return compacted.constraints[compacted_index];
+                return (
+                    compacted.constraints[compacted_index],
+                    compacted.constraint_typevars[compacted_index],
+                );
             }
-            return storage.constraints[ConstraintId::from_usize(index - split)];
+            let local_id = ConstraintId::from_usize(index - split);
+            return (
+                storage.constraints[local_id],
+                storage.constraint_typevars[local_id],
+            );
         }
-        storage.constraints[constraint]
+        (
+            storage.constraints[constraint],
+            storage.constraint_typevars[constraint],
+        )
     }
 
     fn cached_constraint_implies(
@@ -1716,12 +1749,9 @@ impl ConstraintId {
         builder: &ConstraintSetBuilder<'db>,
         other: Self,
     ) -> bool {
-        let self_constraint = builder.constraint_data(self);
-        let other_constraint = builder.constraint_data(other);
-        if !self_constraint
-            .typevar
-            .is_same_typevar_as(db, other_constraint.typevar)
-        {
+        let (self_constraint, self_typevar_id) = builder.constraint_data_with_typevar_id(self);
+        let (other_constraint, other_typevar_id) = builder.constraint_data_with_typevar_id(other);
+        if self_typevar_id != other_typevar_id {
             return false;
         }
         other_constraint
@@ -4299,18 +4329,18 @@ impl InteriorNode {
 
             // If the constraints refer to different typevars, the only simplifications we can make
             // are of the form `S ≤ T ∧ T ≤ int → S ≤ int`.
-            let left_constraint_data = builder.constraint_data(left_constraint);
-            let left_typevar = left_constraint_data.typevar;
-            let right_constraint_data = builder.constraint_data(right_constraint);
-            let right_typevar = right_constraint_data.typevar;
-            if !left_typevar.is_same_typevar_as(db, right_typevar) {
+            let (left_constraint_data, left_typevar_id) =
+                builder.constraint_data_with_typevar_id(left_constraint);
+            let (right_constraint_data, right_typevar_id) =
+                builder.constraint_data_with_typevar_id(right_constraint);
+            if left_typevar_id != right_typevar_id {
                 // We've structured our constraints so that a typevar's upper/lower bound can only
                 // be another typevar if the bound is "later" in our arbitrary ordering. That means
                 // we only have to check this pair of constraints in one direction — though we do
                 // have to figure out which of the two typevars is constrained, and which one is
                 // the upper/lower bound.
                 let (bound_constraint, constrained_constraint) =
-                    if left_typevar.can_be_bound_for(db, builder, right_typevar) {
+                    if left_typevar_id.index() < right_typevar_id.index() {
                         (left_constraint, right_constraint)
                     } else {
                         (right_constraint, left_constraint)
@@ -5320,12 +5350,12 @@ impl SequentMap {
         //
         // If all of the lower and upper bounds are concrete (i.e., not typevars), then there
         // several _other_ sequents that we can add, as handled by `add_concrete_sequents`.
-        let left_constraint_data = builder.constraint_data(left_constraint);
-        let left_typevar = left_constraint_data.typevar;
-        let right_constraint_data = builder.constraint_data(right_constraint);
-        let right_typevar = right_constraint_data.typevar;
+        let (left_constraint_data, left_typevar_id) =
+            builder.constraint_data_with_typevar_id(left_constraint);
+        let (right_constraint_data, right_typevar_id) =
+            builder.constraint_data_with_typevar_id(right_constraint);
 
-        if !left_typevar.is_same_typevar_as(db, right_typevar) {
+        if left_typevar_id != right_typevar_id {
             self.add_mutual_sequents_for_different_typevars(
                 db,
                 builder,
@@ -5373,24 +5403,22 @@ impl SequentMap {
         // we only have to check this pair of constraints in one direction — though we do
         // have to figure out which of the two typevars is constrained, and which one is
         // the upper/lower bound.
-        let left_constraint_data = builder.constraint_data(left_constraint);
-        let left_typevar = left_constraint_data.typevar;
-        let right_constraint_data = builder.constraint_data(right_constraint);
-        let right_typevar = right_constraint_data.typevar;
-        let (bound_constraint, constrained_constraint) =
-            if left_typevar.can_be_bound_for(db, builder, right_typevar) {
-                (left_constraint, right_constraint)
+        let (left_constraint_data, left_typevar_id) =
+            builder.constraint_data_with_typevar_id(left_constraint);
+        let (right_constraint_data, right_typevar_id) =
+            builder.constraint_data_with_typevar_id(right_constraint);
+        let (bound_constraint_data, constrained_constraint_data) =
+            if left_typevar_id.index() < right_typevar_id.index() {
+                (left_constraint_data, right_constraint_data)
             } else {
-                (right_constraint, left_constraint)
+                (right_constraint_data, left_constraint_data)
             };
 
         // We then look for cases where the "constrained" typevar's upper and/or lower bound
         // matches the "bound" typevar. If so, we're going to add an implication sequent that
         // replaces the upper/lower bound that matched with the bound constraint's corresponding
         // bound.
-        let bound_constraint_data = builder.constraint_data(bound_constraint);
         let bound_typevar = bound_constraint_data.typevar;
-        let constrained_constraint_data = builder.constraint_data(constrained_constraint);
         let constrained_typevar = constrained_constraint_data.typevar;
 
         // Transitive pivots require subtyping; classes with dynamic bases can be assignable to
